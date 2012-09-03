@@ -1,0 +1,191 @@
+#!/usr/bin/env ruby
+
+#require 'xcode_make'
+#XcodeMake.run_make_wrapper(*ARGV)
+
+MAKE_BINARY = '/usr/bin/make'
+
+project_file_path = ENV['PROJECT_FILE_PATH']
+if project_file_path.nil? || project_file_path.empty?
+  # Seems we're not being run from within Xcode. No point in doing
+  # the wrapping and parsing if we have no project file to write to.
+  exec(MAKE_BINARY, *ARGV)
+end
+
+Signal.trap("SIGINT") do
+  exit(128 + 2)
+end
+
+require 'Open3'
+MARKER = '!!!xmake!!!'
+TMP_FILE = 'xcode-make.tmp'
+
+# Make sure our wrappers are called, so we can print the PWD
+ENV['PATH'] = "#{File.dirname(__FILE__)}/wrappers:#{ENV['PATH']}"
+
+compile_step = Regexp.new("^#{MARKER} PWD=(\\S+?)\\s.*\\s-c(\\s|$)")
+ignored_compiler_parts = Regexp.new('(^| )*-(o|x|include|arch|Xclang|name) +[^ ]+ *')
+source_file = Regexp.new('(^| )([^- ][^ ]*\.(c|cpp|m|mm))( |$)')
+defines_and_includes = Regexp.new('\s(-D\S+|-I\S+)')
+
+make_directory_switch = Regexp.new('^make.*?: Entering directory `(.*?)\'$')
+issue = Regexp.new('^(.+?):(\d+:){0,2} (warning|error|info): (.*)$')
+
+discovered_files = {}
+
+ENV['PROJECT_TEMP_DIR'] = "/tmp"
+tmp_file_path = File.join(ENV['PROJECT_TEMP_DIR'], TMP_FILE)
+if File.exists?(tmp_file_path)
+  File.open(tmp_file_path, "rb") {|f| discovered_files = Marshal.load(f)}
+end
+
+ARGV.unshift(MAKE_BINARY)
+
+# Try to catch errors from makefiles by having make print the
+# working directory for each recursive makefile.
+ARGV.push('--print-directory')
+make_directory = ''
+
+# Sadly we can't use the same working directory for compilation issues,
+# as make might have recursed to another directory by the time clang
+# finishes compilation and prints issues to stderr. This should not be
+# an issue with make itself, assuming it flushes stderr each time it
+# recurses into a new directory.
+
+build_exit_status = 0
+
+Open3.popen2e(*ARGV) do |stdin, stdout_and_stderr, wait_thr|
+  stdout_and_stderr.each do |line|
+
+    if line.start_with?(MARKER)
+      compiler_line = compile_step.match(line)
+      next if not compiler_line
+
+      pwd = compiler_line[1]
+
+      file_name = line.gsub(ignored_compiler_parts, ' ')
+      file_name = source_file.match(file_name)
+      next if not file_name
+
+      # The input filename should already be absolute, thanks to
+      # the work done in the wrapper.
+      file_name = file_name[0].strip
+
+      compiler_flags = ""
+      line.scan(defines_and_includes) do |define_or_include|
+        define_or_include = define_or_include[0]
+        define_or_include.match(/-I(.+)/) do |include|
+          # We still need to make sure include paths are absolute, as the
+          # wrapper does not handle that part.
+          define_or_include = "-I#{File.absolute_path(include[1], pwd)}"
+        end
+
+        compiler_flags += " #{define_or_include}"
+      end
+
+      discovered_files[file_name] = compiler_flags.strip
+
+      next # Early return, we don't want to print these lines
+
+    elsif make_directory_switch.match(line)
+      make_directory = $1
+
+    elsif issue.match(line)
+      issue_file = $1
+
+      # This will only have an effect on issues reported by make, as clang
+      # will report absolute file names thanks to the work done in the wrapper.
+      line.gsub!(issue_file, File.absolute_path(issue_file, make_directory))
+    end
+
+    # Make sure the output reaches Xcode
+    puts line
+    $stdout.flush
+  end
+
+  build_exit_status = wait_thr.value.exitstatus
+end
+
+if build_exit_status > 0
+   # Save any discovered files for the next possibly successful build
+  File.open(tmp_file_path, "wb") do |file|
+     Marshal.dump(discovered_files, file)
+  end
+
+  exit(build_exit_status)
+end
+
+# We're now ready to update the Xcode project file
+
+puts "xcode-make: Build completed successfully. Processing discovered files..."
+$stdout.flush
+
+old_verbose = $VERBOSE
+$VERBOSE = nil # Ignore warnings from xcoder
+require 'xcoder'
+$VERBOSE = old_verbose
+
+# FIXME: Read encoding from project file instead of assuming UTF-8
+Encoding.default_external = 'utf-8'
+project = Xcode.project(project_file_path)
+
+indexer_target = project.targets.find{|t| t.name == 'Indexer' }
+if not indexer_target
+  # Create the indexer target
+  indexer_target = project.create_target('Indexer', :native)
+  project.global_configs.each do |config|
+    indexer_target.create_configuration(config.name) do |new_config|
+      # For some reason we need PRODUCT_NAME. Inherit the rest from the global config
+      new_config.build_settings = { 'PRODUCT_NAME' => '$(TARGET_NAME)' }
+    end
+  end
+
+  # TODO: Remove added scheme for Indexer (requires support from xcoder)
+  # TODO: Add Indexer as Analyze step to the main build target's scheme
+
+  project.save!
+end
+
+sources_build_phase = indexer_target.sources_build_phase || indexer_target.create_build_phase(:sources)
+
+existing_sources = Hash[ *sources_build_phase.files.collect { |file| [ file.file_ref.path, file.settings['COMPILER_FLAGS'] ] }.flatten ]
+
+changed_sources = discovered_files.dup.delete_if { |k, v| existing_sources[k] == v }
+
+puts "xcode-make: Existing: #{existing_sources.length}, discovered: #{discovered_files.length}, changed: #{changed_sources.length}"
+
+changed_sources.each do |file_name, compiler_flags|
+
+  file = sources_build_phase.file(file_name)
+  if not file
+    basename = File.basename(file_name)
+    file_reference = Xcode::FileReference.file({ "path" => file_name, 'name' => basename, 'sourceTree' => '<absolute>'})
+    file_reference = project.registry.add_object(file_reference)
+
+    sources_build_phase.add_build_file(file_reference, { 'COMPILER_FLAGS' => compiler_flags })
+    puts "xcode-make: Added #{file_name} to indexer"
+
+  else
+    file.settings['COMPILER_FLAGS'] = compiler_flags
+    file.save!
+    puts "xcode-make: Updated compiler flags for #{file_name}"
+  end
+
+  $stdout.flush
+end
+
+if changed_sources.length > 0
+  puts "xcode-make: Saving project file..."
+  # Saving the project is not atomic, as xcoder does a second step of reformatting,
+  # after the initial save. We do a manual save to make it appear atomic for Xcode.
+  tmp_project_path = '/tmp/xmake'
+  project.save(tmp_project_path)
+  FileUtils.copy(File.join(tmp_project_path, 'project.pbxproj'), project_file_path)
+end
+
+# No need for the temp file anymore
+File.delete(tmp_file_path) if File.exists?(tmp_file_path)
+
+puts "xcode-make: Done!"
+
+exit(build_exit_status)
